@@ -172,11 +172,13 @@ def main():
     else:
         drop_rate = [0.0, 0.0, 0.0]
     eps_no_archs = [10, 10, 10]
+    global_epoch = 0
     for sp in range(len(num_to_keep)):
         model = Network(args.init_channels + int(add_width[sp]), CIFAR_CLASSES, args.layers + int(add_layers[sp]), criterion, switches_normal=switches_normal, switches_reduce=switches_reduce, p=float(drop_rate[sp]), C_in=input_channels)
         model = nn.DataParallel(model)
         model = model.cuda()
-        logging.info("param size = %fMB", utils.count_parameters_in_MB(model))
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logging.info("param count = %d", n_params)
         network_params = []
         for k, v in model.named_parameters():
             if not (k.endswith('alphas_normal') or k.endswith('alphas_reduce')):
@@ -208,13 +210,21 @@ def main():
                 model.module.p = float(drop_rate[sp]) * np.exp(-(epoch - eps_no_arch) * scale_factor) 
                 model.module.update_p()                
                 train_acc, train_obj = train(train_queue, valid_queue, model, network_params, criterion, optimizer, optimizer_a, lr, train_arch=True)
-            logging.info('Train_acc %f', train_acc)
+            logging.info('Train_acc %.4f Train_loss %e', train_acc / 100., train_obj)
             epoch_duration = time.time() - epoch_start
             logging.info('Epoch time: %ds', epoch_duration)
-            # validation
-            if epochs - epoch < 5:
-                valid_acc, valid_obj = infer(valid_queue, model, criterion)
-                logging.info('Valid_acc %f', valid_acc)
+            valid_acc, valid_obj = infer(valid_queue, model, criterion)
+            logging.info('Valid_acc %.4f Valid_loss %e', valid_acc / 100., valid_obj)
+            test_acc, test_obj = infer(test_queue, model, criterion)
+            logging.info('Test_acc  %.4f Test_loss  %e', test_acc / 100., test_obj)
+            n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            tracker.log_metrics({
+                'training/train accuracy': train_acc / 100., 'training/train loss': train_obj,
+                'training/val accuracy': valid_acc / 100., 'training/val loss': valid_obj,
+                'training/test accuracy':  test_acc  / 100., 'training/test loss':  test_obj,
+                'training/nb of parameters': n_params,
+            }, step=global_epoch, step_name='epoch')
+            global_epoch += 1
         utils.save(model, os.path.join(args.save, 'weights.pt'))
         print('------Dropping %d paths------' % num_to_drop[sp])
         # Save switches info for s-c refinement. 
@@ -310,7 +320,18 @@ def main():
                     num_sk = check_sk_number(switches_normal)
                 logging.info('Number of skip-connect: %d', max_sk)
                 genotype = parse_network(switches_normal, switches_reduce)
-                logging.info(genotype)              
+                logging.info(genotype)
+    final_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logging.info('Final model param count = %d', final_params)
+    tracker.log_metric('training/nb of parameters', final_params, step=global_epoch, step_name='epoch')
+    tracker.log_pytorch_model(
+            model=model,
+            name=f"DARTS_{args.dataset}",
+            x=None,
+            path=args.tmpdir,
+            run_id=False,
+        )
+    tracker.end_run()
 
 def train(train_queue, valid_queue, model, network_params, criterion, optimizer, optimizer_a, lr, train_arch=True):
     objs = utils.AvgrageMeter()
