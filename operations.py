@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 OPS = {
   'none' : lambda C, stride, affine: Zero(stride),
@@ -94,8 +95,8 @@ class Zero(nn.Module):
     self.stride = stride
   def forward(self, x):
     n, c, h, w = x.size()
-    h //= self.stride
-    w //= self.stride
+    h = (h + self.stride - 1) // self.stride
+    w = (w + self.stride - 1) // self.stride
     if x.is_cuda:
       with torch.cuda.device(x.get_device()):
         padding = torch.cuda.FloatTensor(n, c, h, w).fill_(0)
@@ -115,6 +116,10 @@ class FactorizedReduce(nn.Module):
 
   def forward(self, x):
     x = self.relu(x)
+    if x.size(2) % 2 == 1:
+        x = F.pad(x, (0, 0, 0, 1))
+    if x.size(3) % 2 == 1:
+        x = F.pad(x, (0, 1, 0, 0))
     out = torch.cat([self.conv_1(x), self.conv_2(x[:,:,1:,1:])], dim=1)
     out = self.bn(out)
     return out
