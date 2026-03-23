@@ -1,0 +1,11 @@
+# Python executables
+__pycache__
+
+# IDE
+.vscode
+
+# Results
+tmp/
+
+# Logs
+wandb/

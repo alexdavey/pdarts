@@ -11,11 +11,22 @@ import torch.nn as nn
 import torch.utils
 import torch.nn.functional as F
 import torchvision.datasets as dset
+import torchvision.transforms as transforms
 import torch.backends.cudnn as cudnn
 import copy
 from model_search import Network
 from genotypes import PRIMITIVES
 from genotypes import Genotype
+
+
+if "/home/sdouka/Documents/Projects/InriaGitlab/experimental_grow/" not in sys.path:
+    sys.path.append("/home/sdouka/Documents/Projects/InriaGitlab/experimental_grow/")
+if "/home/tau/sdouka/codebase/experimental_grow" not in sys.path:
+    sys.path.append("/home/tau/sdouka/codebase/experimental_grow")
+
+from tools.datasets import known_datasets, get_num_classes
+from tools.augmentations import default_augmentations, get_transforms, npy_datasets
+from logger import Logger
 
 
 parser = argparse.ArgumentParser("cifar")
@@ -32,18 +43,35 @@ parser.add_argument('--layers', type=int, default=5, help='total number of layer
 parser.add_argument('--cutout', action='store_true', default=False, help='use cutout')
 parser.add_argument('--cutout_length', type=int, default=16, help='cutout length')
 parser.add_argument('--drop_path_prob', type=float, default=0.3, help='drop path probability')
-parser.add_argument('--save', type=str, default='/tmp/checkpoints/', help='experiment path')
+parser.add_argument('--save', type=str, default='tmp/checkpoints/', help='experiment path')
 parser.add_argument('--seed', type=int, default=2, help='random seed')
 parser.add_argument('--grad_clip', type=float, default=5, help='gradient clipping')
 parser.add_argument('--train_portion', type=float, default=0.5, help='portion of training data')
 parser.add_argument('--arch_learning_rate', type=float, default=6e-4, help='learning rate for arch encoding')
 parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for arch encoding')
-parser.add_argument('--tmp_data_dir', type=str, default='/tmp/cache/', help='temp data dir')
+parser.add_argument('--data', type=str, default='../data', help='dataset root directory')
 parser.add_argument('--note', type=str, default='try', help='note for this run')
 parser.add_argument('--dropout_rate', action='append', default=[], help='dropout rate of skip connect')
 parser.add_argument('--add_width', action='append', default=['0'], help='add channels')
 parser.add_argument('--add_layers', action='append', default=['0'], help='add layers')
 parser.add_argument('--cifar100', action='store_true', default=False, help='search with cifar100 dataset')
+parser.add_argument('--dataset', type=str, default=None,
+                    help='custom dataset name (e.g. addnist, multnist, cifartile, geoclassing, '
+                         'chesseract, gameoflife, gutenberg, language); '
+                         'overrides --cifar100 when set')
+parser.add_argument('--no-augment', action='store_true', default=False,
+                    help='disable data augmentation')
+parser.add_argument('--experiment_name', type=str, default='NAS',
+                    help='experiment name for the logger')
+parser.add_argument('--no-logger', action='store_true', default=False,
+                    help='disable experiment logger')
+parser.add_argument('--logger_api', type=str, default='wandb',
+                    choices=['mlflow', 'wandb'], help='logging backend')
+parser.add_argument('--logger_port', type=int, default=27027,
+                    help='port for the local logging server')
+parser.add_argument('--log_path', type=str, default=None,
+                    help='local directory for logger storage (mlflow tracking URI / wandb dir)')
+parser.add_argument("--tmpdir", type=str, default="tmp")
 
 args = parser.parse_args()
 
@@ -57,12 +85,8 @@ fh = logging.FileHandler(os.path.join(args.save, 'log.txt'))
 fh.setFormatter(logging.Formatter(log_format))
 logging.getLogger().addHandler(fh)
 
-if args.cifar100:
-    CIFAR_CLASSES = 100
-    data_folder = 'cifar-100-python'
-else:
-    CIFAR_CLASSES = 10
-    data_folder = 'cifar-10-batches-py'
+_dataset_name = 'cifar100' if args.cifar100 else (args.dataset or 'cifar10')
+CIFAR_CLASSES = get_num_classes(_dataset_name)
 def main():
     if not torch.cuda.is_available():
         logging.info('No GPU device available')
@@ -73,15 +97,34 @@ def main():
     cudnn.enabled=True
     torch.cuda.manual_seed(args.seed)
     logging.info("args = %s", args)
+    tracker = Logger(args.experiment_name, port=args.logger_port,
+                     api=args.logger_api, enabled=not args.no_logger)
+    tracker.setup_tracking(file_path=args.log_path)
+    tracker.start_run(group="P-DARTS")
+    for key, value in vars(args).items():
+        if key in ("no-logger", "api", "exp_name", "port", "log_path", "tmpdir"):
+                continue
+        tracker.log_parameter(key, str(value))
     #  prepare dataset
-    if args.cifar100:
-        train_transform, valid_transform = utils._data_transforms_cifar100(args)
+    dataset_name = 'cifar100' if args.cifar100 else (args.dataset or 'cifar10')
+    augmentations = None if args.no_augment else default_augmentations.get(dataset_name, [])
+    base_transforms, aug_transforms = get_transforms(dataset_name, augmentations)
+    if dataset_name in npy_datasets:
+        train_transform = transforms.Compose(base_transforms + aug_transforms)
     else:
-        train_transform, valid_transform = utils._data_transforms_cifar10(args)
-    if args.cifar100:
-        train_data = dset.CIFAR100(root=args.tmp_data_dir, train=True, download=True, transform=train_transform)
+        train_transform = transforms.Compose(aug_transforms + base_transforms)
+    valid_transform = transforms.Compose(base_transforms)
+    dataset_cls = known_datasets[dataset_name]
+    if dataset_name == 'svhn':
+        train_data = dataset_cls(root=args.data, split='train',
+                                 download=True, transform=train_transform)
+        test_data = dataset_cls(root=args.data, split='test',
+                                download=True, transform=valid_transform)
     else:
-        train_data = dset.CIFAR10(root=args.tmp_data_dir, train=True, download=True, transform=train_transform)
+        train_data = dataset_cls(root=args.data, train=True,
+                                 download=True, transform=train_transform)
+        test_data = dataset_cls(root=args.data, train=False,
+                                download=True, transform=valid_transform)
 
     num_train = len(train_data)
     indices = list(range(num_train))
@@ -96,7 +139,15 @@ def main():
         train_data, batch_size=args.batch_size,
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[split:num_train]),
         pin_memory=True, num_workers=args.workers)
+
+    test_queue = torch.utils.data.DataLoader(
+        test_data, batch_size=args.batch_size,
+        pin_memory=True, num_workers=args.workers)
     
+    # infer input channels from the dataset
+    input_channels = train_data[0][0].shape[0]
+    logging.info("input channels = %d", input_channels)
+
     # build Network
     criterion = nn.CrossEntropyLoss()
     criterion = criterion.cuda()
