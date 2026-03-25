@@ -15,6 +15,7 @@ import torchvision.transforms as transforms
 import torch.backends.cudnn as cudnn
 import copy
 from model_search import Network
+from model import NetworkCIFAR
 from genotypes import PRIMITIVES
 from genotypes import Genotype
 
@@ -72,6 +73,15 @@ parser.add_argument('--logger_port', type=int, default=27027,
 parser.add_argument('--log_path', type=str, default=None,
                     help='local directory for logger storage (mlflow tracking URI / wandb dir)')
 parser.add_argument("--tmpdir", type=str, default="tmp")
+# Evaluation phase arguments (mirrors train_cifar.py defaults)
+parser.add_argument('--eval_epochs', type=int, default=600, help='eval: num of training epochs')
+parser.add_argument('--eval_init_channels', type=int, default=36, help='eval: num of init channels')
+parser.add_argument('--eval_layers', type=int, default=20, help='eval: total number of layers')
+parser.add_argument('--eval_auxiliary', action='store_true', default=False, help='eval: use auxiliary tower')
+parser.add_argument('--eval_auxiliary_weight', type=float, default=0.4, help='eval: weight for auxiliary loss')
+parser.add_argument('--eval_drop_path_prob', type=float, default=0.3, help='eval: drop path probability')
+parser.add_argument('--eval_learning_rate', type=float, default=0.025, help='eval: init learning rate')
+parser.add_argument('--eval_batch_size', type=int, default=128, help='eval: batch size')
 
 args = parser.parse_args()
 
@@ -87,6 +97,7 @@ logging.getLogger().addHandler(fh)
 
 _dataset_name = 'cifar100' if args.cifar100 else (args.dataset or 'cifar10')
 CIFAR_CLASSES = get_num_classes(_dataset_name)
+
 def main():
     if not torch.cuda.is_available():
         logging.info('No GPU device available')
@@ -102,7 +113,7 @@ def main():
     tracker.setup_tracking(file_path=args.log_path)
     tracker.start_run(group="P-DARTS")
     for key, value in vars(args).items():
-        if key in ("no-logger", "api", "exp_name", "port", "log_path", "tmpdir"):
+        if key in ("no_logger", "api", "exp_name", "port", "log_path", "tmpdir"):
                 continue
         tracker.log_parameter(key, str(value))
     #  prepare dataset
@@ -140,10 +151,6 @@ def main():
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[split:num_train]),
         pin_memory=True, num_workers=args.workers)
 
-    test_queue = torch.utils.data.DataLoader(
-        test_data, batch_size=args.batch_size,
-        pin_memory=True, num_workers=args.workers)
-    
     # infer input channels from the dataset
     input_channels = train_data[0][0].shape[0]
     logging.info("input channels = %d", input_channels)
@@ -173,16 +180,15 @@ def main():
         drop_rate = [0.0, 0.0, 0.0]
     eps_no_archs = [10, 10, 10]
     global_epoch = 0
+    genotype = None
     for sp in range(len(num_to_keep)):
         model = Network(args.init_channels + int(add_width[sp]), CIFAR_CLASSES, args.layers + int(add_layers[sp]), criterion, switches_normal=switches_normal, switches_reduce=switches_reduce, p=float(drop_rate[sp]), C_in=input_channels)
         model = nn.DataParallel(model)
         model = model.cuda()
-        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logging.info("param count = %d", n_params)
         network_params = []
         for k, v in model.named_parameters():
             if not (k.endswith('alphas_normal') or k.endswith('alphas_reduce')):
-                network_params.append(v)       
+                network_params.append(v)
         optimizer = torch.optim.SGD(
                 network_params,
                 args.learning_rate,
@@ -207,33 +213,28 @@ def main():
                 model.module.update_p()
                 train_acc, train_obj = train(train_queue, valid_queue, model, network_params, criterion, optimizer, optimizer_a, lr, train_arch=False)
             else:
-                model.module.p = float(drop_rate[sp]) * np.exp(-(epoch - eps_no_arch) * scale_factor) 
-                model.module.update_p()                
+                model.module.p = float(drop_rate[sp]) * np.exp(-(epoch - eps_no_arch) * scale_factor)
+                model.module.update_p()
                 train_acc, train_obj = train(train_queue, valid_queue, model, network_params, criterion, optimizer, optimizer_a, lr, train_arch=True)
             logging.info('Train_acc %.4f Train_loss %e', train_acc / 100., train_obj)
             epoch_duration = time.time() - epoch_start
             logging.info('Epoch time: %ds', epoch_duration)
             valid_acc, valid_obj = infer(valid_queue, model, criterion)
             logging.info('Valid_acc %.4f Valid_loss %e', valid_acc / 100., valid_obj)
-            test_acc, test_obj = infer(test_queue, model, criterion)
-            logging.info('Test_acc  %.4f Test_loss  %e', test_acc / 100., test_obj)
-            n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             tracker.log_metrics({
-                'training/train accuracy': train_acc / 100., 'training/train loss': train_obj,
-                'training/val accuracy': valid_acc / 100., 'training/val loss': valid_obj,
-                'training/test accuracy':  test_acc  / 100., 'training/test loss':  test_obj,
-                'training/nb of parameters': n_params,
-            }, step=global_epoch, step_name='epoch')
+                'search/train accuracy': train_acc / 100., 'search/train loss': train_obj,
+                'search/val accuracy': valid_acc / 100., 'search/val loss': valid_obj,
+            }, step=global_epoch, step_name='search epoch')
             global_epoch += 1
         utils.save(model, os.path.join(args.save, 'weights.pt'))
         print('------Dropping %d paths------' % num_to_drop[sp])
-        # Save switches info for s-c refinement. 
+        # Save switches info for s-c refinement.
         if sp == len(num_to_keep) - 1:
             switches_normal_2 = copy.deepcopy(switches_normal)
             switches_reduce_2 = copy.deepcopy(switches_reduce)
         # drop operations with low architecture weights
         arch_param = model.module.arch_parameters()
-        normal_prob = F.softmax(arch_param[0], dim=sm_dim).data.cpu().numpy()        
+        normal_prob = F.softmax(arch_param[0], dim=sm_dim).data.cpu().numpy()
         for i in range(14):
             idxs = []
             for j in range(len(PRIMITIVES)):
@@ -262,7 +263,7 @@ def main():
         logging_switches(switches_normal)
         logging.info('switches_reduce = %s', switches_reduce)
         logging_switches(switches_reduce)
-        
+
         if sp == len(num_to_keep) - 1:
             arch_param = model.module.arch_parameters()
             normal_prob = F.softmax(arch_param[0], dim=sm_dim).data.cpu().numpy()
@@ -276,7 +277,7 @@ def main():
                 normal_final[i] = max(normal_prob[i])
                 if switches_reduce_2[i][0] == True:
                     reduce_prob[i][0] = 0
-                reduce_final[i] = max(reduce_prob[i])                
+                reduce_final[i] = max(reduce_prob[i])
             # Generate Architecture, similar to DARTS
             keep_normal = [0, 1]
             keep_reduce = [0, 1]
@@ -309,8 +310,8 @@ def main():
             logging.info('Restricting skipconnect...')
             # generating genotypes with different numbers of skip-connect operations
             for sks in range(0, 9):
-                max_sk = 8 - sks                
-                num_sk = check_sk_number(switches_normal)               
+                max_sk = 8 - sks
+                num_sk = check_sk_number(switches_normal)
                 if not num_sk > max_sk:
                     continue
                 while num_sk > max_sk:
@@ -321,23 +322,23 @@ def main():
                 logging.info('Number of skip-connect: %d', max_sk)
                 genotype = parse_network(switches_normal, switches_reduce)
                 logging.info(genotype)
-    final_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logging.info('Final model param count = %d', final_params)
-    tracker.log_metric('training/nb of parameters', final_params, step=global_epoch, step_name='epoch')
-    tracker.log_pytorch_model(
-            model=model,
-            name=f"DARTS_{args.dataset}",
-            x=None,
-            path=args.tmpdir,
-            run_id=False,
-        )
+
+    # Train and evaluate the discovered architecture
+    if genotype is None:
+        logging.error('Genotype was not found; skipping evaluation phase.')
+        tracker.end_run()
+        return
+    run_evaluation(genotype, train_data, test_data, criterion, tracker, args)
     tracker.end_run()
+
 
 def train(train_queue, valid_queue, model, network_params, criterion, optimizer, optimizer_a, lr, train_arch=True):
     objs = utils.AvgrageMeter()
     top1 = utils.AvgrageMeter()
     top5 = utils.AvgrageMeter()
-    
+    # Fix: initialize iterator before the loop to avoid NameError on first access
+    valid_queue_iter = iter(valid_queue)
+
     for step, (input, target) in enumerate(train_queue):
         model.train()
         n = input.size(0)
@@ -348,7 +349,7 @@ def train(train_queue, valid_queue, model, network_params, criterion, optimizer,
             # the training when using PyTorch 0.4 and above. 
             try:
                 input_search, target_search = next(valid_queue_iter)
-            except:
+            except StopIteration:
                 valid_queue_iter = iter(valid_queue)
                 input_search, target_search = next(valid_queue_iter)
             input_search = input_search.cuda()
@@ -404,6 +405,144 @@ def infer(valid_queue, model, criterion):
     return top1.avg, objs.avg
 
 
+def train_eval(train_queue, model, criterion, optimizer):
+    """Train one epoch of the evaluation model (NetworkCIFAR). Mirrors train_cifar.py."""
+    objs = utils.AvgrageMeter()
+    top1 = utils.AvgrageMeter()
+    model.train()
+
+    for step, (input, target) in enumerate(train_queue):
+        input = input.cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)
+
+        optimizer.zero_grad()
+        logits, logits_aux = model(input)
+        loss = criterion(logits, target)
+        if args.eval_auxiliary:
+            loss_aux = criterion(logits_aux, target)
+            loss += args.eval_auxiliary_weight * loss_aux
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        optimizer.step()
+
+        prec1, _ = utils.accuracy(logits, target, topk=(1, 5))
+        n = input.size(0)
+        objs.update(loss.data.item(), n)
+        top1.update(prec1.data.item(), n)
+
+        if step % args.report_freq == 0:
+            logging.info('Eval TRAIN Step: %03d Objs: %e Acc: %f', step, objs.avg, top1.avg)
+
+    return top1.avg, objs.avg
+
+
+def infer_eval(test_queue, model, criterion):
+    """Evaluate the evaluation model on the test set. Mirrors train_cifar.py."""
+    objs = utils.AvgrageMeter()
+    top1 = utils.AvgrageMeter()
+    model.eval()
+
+    for step, (input, target) in enumerate(test_queue):
+        input = input.cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)
+        with torch.no_grad():
+            logits, _ = model(input)
+            loss = criterion(logits, target)
+
+        prec1, _ = utils.accuracy(logits, target, topk=(1, 5))
+        n = input.size(0)
+        objs.update(loss.data.item(), n)
+        top1.update(prec1.data.item(), n)
+
+        if step % args.report_freq == 0:
+            logging.info('Eval TEST Step: %03d Objs: %e Acc: %f', step, objs.avg, top1.avg)
+
+    return top1.avg, objs.avg
+
+
+def run_evaluation(genotype, train_data, test_data, criterion, tracker, args):
+    """Train and evaluate the discovered architecture (NetworkCIFAR).
+
+    Follows train_cifar.py as closely as possible:
+    - Full training set (no split) for training
+    - Test set evaluated every epoch
+    - Cosine annealing LR, drop path, optional auxiliary loss
+    """
+    logging.info('=== Starting Evaluation Phase ===')
+    logging.info('Genotype: %s', genotype)
+
+    eval_model = NetworkCIFAR(
+        args.eval_init_channels, CIFAR_CLASSES, args.eval_layers,
+        args.eval_auxiliary, genotype
+    )
+    eval_model = nn.DataParallel(eval_model)
+    eval_model = eval_model.cuda()
+    # Initialize drop_path_prob before any forward pass
+    eval_model.module.drop_path_prob = 0.0
+
+    n_params_mb = utils.count_parameters_in_MB(eval_model)
+    n_params = sum(p.numel() for p in eval_model.parameters() if p.requires_grad)
+    logging.info('Eval model param size = %.4fMB (%d params)', n_params_mb, n_params)
+
+    # Full training set — no train/valid split for the evaluation phase
+    eval_train_queue = torch.utils.data.DataLoader(
+        train_data, batch_size=args.eval_batch_size,
+        shuffle=True, pin_memory=True, num_workers=args.workers)
+    eval_test_queue = torch.utils.data.DataLoader(
+        test_data, batch_size=args.eval_batch_size,
+        shuffle=False, pin_memory=True, num_workers=args.workers)
+
+    optimizer = torch.optim.SGD(
+        eval_model.parameters(),
+        args.eval_learning_rate,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, float(args.eval_epochs))
+
+    best_acc = 0.0
+    for epoch in range(args.eval_epochs):
+        scheduler.step()
+        lr = scheduler.get_lr()[0]
+        logging.info('Eval Epoch: %d lr: %e', epoch, lr)
+        eval_model.module.drop_path_prob = args.eval_drop_path_prob * epoch / args.eval_epochs
+
+        epoch_start = time.time()
+        train_acc, train_obj = train_eval(eval_train_queue, eval_model, criterion, optimizer)
+        logging.info('Eval Train_acc %.4f Train_loss %e', train_acc / 100., train_obj)
+
+        test_acc, test_obj = infer_eval(eval_test_queue, eval_model, criterion)
+        if test_acc > best_acc:
+            best_acc = test_acc
+        logging.info('Eval Test_acc  %.4f Test_loss  %e', test_acc / 100., test_obj)
+        logging.info('Eval Epoch time: %ds', time.time() - epoch_start)
+
+        tracker.log_metrics({
+            'training/train accuracy': train_acc / 100.,
+            'training/train loss': train_obj,
+            'training/test accuracy': test_acc / 100.,
+            'training/test loss': test_obj,
+        }, step=epoch, step_name='epoch')
+
+        utils.save(eval_model, os.path.join(args.save, 'eval_weights.pt'))
+
+    logging.info('Eval best test accuracy: %.4f', best_acc / 100.)
+
+    # Log final trained evaluation model
+    final_params = sum(p.numel() for p in eval_model.parameters() if p.requires_grad)
+    logging.info('Final eval model param count = %d', final_params)
+    tracker.log_metric('training/nb of parameters', final_params,
+                       step=0, step_name='epoch')
+    tracker.log_pytorch_model(
+        model=eval_model,
+        name=f"DARTS_{_dataset_name}",
+        x=None,
+        path=args.tmpdir,
+        run_id=False,
+    )
+    return eval_model
+
+
 def parse_network(switches_normal, switches_reduce):
 
     def _parse_switches(switches):
@@ -422,14 +561,14 @@ def parse_network(switches_normal, switches_reduce):
         return gene
     gene_normal = _parse_switches(switches_normal)
     gene_reduce = _parse_switches(switches_reduce)
-    
+
     concat = range(2, 6)
-    
+
     genotype = Genotype(
-        normal=gene_normal, normal_concat=concat, 
+        normal=gene_normal, normal_concat=concat,
         reduce=gene_reduce, reduce_concat=concat
     )
-    
+
     return genotype
 
 def get_min_k(input_in, k):
@@ -439,13 +578,14 @@ def get_min_k(input_in, k):
         idx = np.argmin(input)
         index.append(idx)
         input[idx] = 1
-    
+
     return index
+
 def get_min_k_no_zero(w_in, idxs, k):
     w = copy.deepcopy(w_in)
     index = []
     if 0 in idxs:
-        zf = True 
+        zf = True
     else:
         zf = False
     if zf:
@@ -459,7 +599,7 @@ def get_min_k_no_zero(w_in, idxs, k):
             idx = idx + 1
         index.append(idx)
     return index
-        
+
 def logging_switches(switches):
     for i in range(len(switches)):
         ops = []
@@ -467,13 +607,13 @@ def logging_switches(switches):
             if switches[i][j]:
                 ops.append(PRIMITIVES[j])
         logging.info(ops)
-        
+
 def check_sk_number(switches):
     count = 0
     for i in range(len(switches)):
         if switches[i][3]:
             count = count + 1
-    
+
     return count
 
 def delete_min_sk_prob(switches_in, switches_bk, probs_in):
@@ -495,7 +635,7 @@ def delete_min_sk_prob(switches_in, switches_bk, probs_in):
     d_idx = np.argmin(sk_prob)
     idx = _get_sk_idx(switches_in, switches_bk, d_idx)
     probs_out[d_idx][idx] = 0.0
-    
+
     return probs_out
 
 def keep_1_on(switches_in, probs):
@@ -507,7 +647,7 @@ def keep_1_on(switches_in, probs):
                 idxs.append(j)
         drop = get_min_k_no_zero(probs[i, :], idxs, 2)
         for idx in drop:
-            switches[i][idxs[idx]] = False            
+            switches[i][idxs[idx]] = False
     return switches
 
 def keep_2_branches(switches_in, probs):
@@ -529,12 +669,12 @@ def keep_2_branches(switches_in, probs):
     for i in range(len(switches)):
         if not i in keep:
             for j in range(len(PRIMITIVES)):
-                switches[i][j] = False  
-    return switches  
+                switches[i][j] = False
+    return switches
 
 if __name__ == '__main__':
     start_time = time.time()
-    main() 
+    main()
     end_time = time.time()
     duration = end_time - start_time
     logging.info('Total searching time: %ds', duration)
