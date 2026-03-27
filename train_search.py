@@ -328,7 +328,7 @@ def main():
         logging.error('Genotype was not found; skipping evaluation phase.')
         tracker.end_run()
         return
-    run_evaluation(genotype, train_data, test_data, criterion, tracker, args)
+    run_evaluation(genotype, train_data, test_data, criterion, tracker, args, input_channels)
     tracker.end_run()
 
 
@@ -460,7 +460,7 @@ def infer_eval(test_queue, model, criterion):
     return top1.avg, objs.avg
 
 
-def run_evaluation(genotype, train_data, test_data, criterion, tracker, args):
+def run_evaluation(genotype, train_data, test_data, criterion, tracker, args, input_channels=3):
     """Train and evaluate the discovered architecture (NetworkCIFAR).
 
     Follows train_cifar.py as closely as possible:
@@ -473,7 +473,7 @@ def run_evaluation(genotype, train_data, test_data, criterion, tracker, args):
 
     eval_model = NetworkCIFAR(
         args.eval_init_channels, CIFAR_CLASSES, args.eval_layers,
-        args.eval_auxiliary, genotype
+        args.eval_auxiliary, genotype, C_in=input_channels
     )
     eval_model = nn.DataParallel(eval_model)
     eval_model = eval_model.cuda()
