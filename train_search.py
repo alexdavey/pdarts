@@ -323,6 +323,14 @@ def main():
                 genotype = parse_network(switches_normal, switches_reduce)
                 logging.info(genotype)
 
+    # Free search-phase memory before evaluation
+    del model, optimizer, optimizer_a, scheduler
+    del train_queue, valid_queue
+    del arch_param, normal_prob, reduce_prob
+    del switches_normal, switches_reduce, switches_normal_2, switches_reduce_2
+    del network_params, normal_final, reduce_final
+    torch.cuda.empty_cache()
+
     # Train and evaluate the discovered architecture
     if genotype is None:
         logging.error('Genotype was not found; skipping evaluation phase.')
