@@ -384,7 +384,7 @@ class Logger:
         experiment_name : str
             name for experiment bucket on mlflow server
         """
-        api_key = os.environ.get("WANDB_KEY")
+        api_key = os.environ.get("WANDB_KEY") or os.environ.get("WANDB_API_KEY")
         wandb.login(key=api_key)
         self.file_path = file_path
 

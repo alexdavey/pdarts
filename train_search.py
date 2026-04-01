@@ -55,6 +55,8 @@ parser.add_argument('--note', type=str, default='try', help='note for this run')
 parser.add_argument('--dropout_rate', action='append', default=[], help='dropout rate of skip connect')
 parser.add_argument('--add_width', action='append', default=['0'], help='add channels')
 parser.add_argument('--add_layers', action='append', default=['0'], help='add layers')
+parser.add_argument('--cell_nodes', dest='cell_steps', type=int, default=4,
+                    help='Number of intermediate nodes in a cell')
 parser.add_argument('--cifar100', action='store_true', default=False, help='search with cifar100 dataset')
 parser.add_argument('--dataset', type=str, default=None,
                     help='custom dataset name (e.g. addnist, multnist, cifartile, geoclassing, '
@@ -62,7 +64,7 @@ parser.add_argument('--dataset', type=str, default=None,
                          'overrides --cifar100 when set')
 parser.add_argument('--no-augment', action='store_true', default=False,
                     help='disable data augmentation')
-parser.add_argument('--experiment_name', type=str, default='NAS',
+parser.add_argument('--experiment_name', type=str, default=None,
                     help='experiment name for the logger')
 parser.add_argument('--no-logger', action='store_true', default=False,
                     help='disable experiment logger')
@@ -85,6 +87,11 @@ parser.add_argument('--eval_batch_size', type=int, default=128, help='eval: batc
 
 args = parser.parse_args()
 
+def default_experiment_name(args, dataset_name):
+    if args.logger_api == 'wandb':
+        return f"PDARTS/l{args.eval_layers}_n{args.cell_steps}/{dataset_name}/{args.seed}"
+    return 'NAS'
+
 args.save = '{}search-{}-{}'.format(args.save, args.note, time.strftime("%Y%m%d-%H%M%S"))
 utils.create_exp_dir(args.save, scripts_to_save=glob.glob('*.py'))
 
@@ -96,7 +103,32 @@ fh.setFormatter(logging.Formatter(log_format))
 logging.getLogger().addHandler(fh)
 
 _dataset_name = 'cifar100' if args.cifar100 else (args.dataset or 'cifar10')
+if args.experiment_name is None:
+    args.experiment_name = default_experiment_name(args, _dataset_name)
 CIFAR_CLASSES = get_num_classes(_dataset_name)
+
+
+def num_cell_edges(steps):
+    return sum(2 + i for i in range(steps))
+
+
+def iter_cell_edge_ranges(steps):
+    start = 0
+    for width in range(2, steps + 2):
+        end = start + width
+        yield start, end
+        start = end
+
+
+def infer_cell_steps(num_edges):
+    steps = 0
+    total_edges = 0
+    while total_edges < num_edges:
+        total_edges += steps + 2
+        steps += 1
+    if total_edges != num_edges:
+        raise ValueError(f"Invalid edge count for a cell: {num_edges}")
+    return steps
 
 def main():
     if not torch.cuda.is_available():
@@ -158,8 +190,9 @@ def main():
     # build Network
     criterion = nn.CrossEntropyLoss()
     criterion = criterion.cuda()
+    num_edges = num_cell_edges(args.cell_steps)
     switches = []
-    for i in range(14):
+    for i in range(num_edges):
         switches.append([True for j in range(len(PRIMITIVES))])
     switches_normal = copy.deepcopy(switches)
     switches_reduce = copy.deepcopy(switches)
@@ -173,7 +206,8 @@ def main():
     if len(args.add_layers) == 3:
         add_layers = args.add_layers
     else:
-        add_layers = [0, 6, 12]
+        assert False, "3 add_layers must be specified"
+        # add_layers = [0, 6, 12]
     if len(args.dropout_rate) ==3:
         drop_rate = args.dropout_rate
     else:
@@ -182,7 +216,7 @@ def main():
     global_epoch = 0
     genotype = None
     for sp in range(len(num_to_keep)):
-        model = Network(args.init_channels + int(add_width[sp]), CIFAR_CLASSES, args.layers + int(add_layers[sp]), criterion, switches_normal=switches_normal, switches_reduce=switches_reduce, p=float(drop_rate[sp]), C_in=input_channels)
+        model = Network(args.init_channels + int(add_width[sp]), CIFAR_CLASSES, args.layers + int(add_layers[sp]), criterion, steps=args.cell_steps, multiplier=args.cell_steps, switches_normal=switches_normal, switches_reduce=switches_reduce, p=float(drop_rate[sp]), C_in=input_channels)
         model = nn.DataParallel(model)
         model = model.cuda()
         network_params = []
@@ -235,7 +269,7 @@ def main():
         # drop operations with low architecture weights
         arch_param = model.module.arch_parameters()
         normal_prob = F.softmax(arch_param[0], dim=sm_dim).data.cpu().numpy()
-        for i in range(14):
+        for i in range(num_edges):
             idxs = []
             for j in range(len(PRIMITIVES)):
                 if switches_normal[i][j]:
@@ -248,7 +282,7 @@ def main():
             for idx in drop:
                 switches_normal[i][idxs[idx]] = False
         reduce_prob = F.softmax(arch_param[1], dim=-1).data.cpu().numpy()
-        for i in range(14):
+        for i in range(num_edges):
             idxs = []
             for j in range(len(PRIMITIVES)):
                 if switches_reduce[i][j]:
@@ -268,10 +302,10 @@ def main():
             arch_param = model.module.arch_parameters()
             normal_prob = F.softmax(arch_param[0], dim=sm_dim).data.cpu().numpy()
             reduce_prob = F.softmax(arch_param[1], dim=sm_dim).data.cpu().numpy()
-            normal_final = [0 for idx in range(14)]
-            reduce_final = [0 for idx in range(14)]
+            normal_final = [0 for idx in range(num_edges)]
+            reduce_final = [0 for idx in range(num_edges)]
             # remove all Zero operations
-            for i in range(14):
+            for i in range(num_edges):
                 if switches_normal_2[i][0] == True:
                     normal_prob[i][0] = 0
                 normal_final[i] = max(normal_prob[i])
@@ -279,12 +313,10 @@ def main():
                     reduce_prob[i][0] = 0
                 reduce_final[i] = max(reduce_prob[i])
             # Generate Architecture, similar to DARTS
-            keep_normal = [0, 1]
-            keep_reduce = [0, 1]
-            n = 3
-            start = 2
-            for i in range(3):
-                end = start + n
+            keep_normal = []
+            keep_reduce = []
+            for start, end in iter_cell_edge_ranges(args.cell_steps):
+                n = end - start
                 tbsn = normal_final[start:end]
                 tbsr = reduce_final[start:end]
                 edge_n = sorted(range(n), key=lambda x: tbsn[x])
@@ -293,10 +325,8 @@ def main():
                 edge_r = sorted(range(n), key=lambda x: tbsr[x])
                 keep_reduce.append(edge_r[-1] + start)
                 keep_reduce.append(edge_r[-2] + start)
-                start = end
-                n = n + 1
             # set switches according the ranking of arch parameters
-            for i in range(14):
+            for i in range(num_edges):
                 if not i in keep_normal:
                     for j in range(len(PRIMITIVES)):
                         switches_normal[i][j] = False
@@ -309,8 +339,8 @@ def main():
             ## restrict skipconnect (normal cell only)
             logging.info('Restricting skipconnect...')
             # generating genotypes with different numbers of skip-connect operations
-            for sks in range(0, 9):
-                max_sk = 8 - sks
+            for sks in range(0, 2 * args.cell_steps + 1):
+                max_sk = 2 * args.cell_steps - sks
                 num_sk = check_sk_number(switches_normal)
                 if not num_sk > max_sk:
                     continue
@@ -554,23 +584,18 @@ def run_evaluation(genotype, train_data, test_data, criterion, tracker, args, in
 def parse_network(switches_normal, switches_reduce):
 
     def _parse_switches(switches):
-        n = 2
-        start = 0
         gene = []
-        step = 4
-        for i in range(step):
-            end = start + n
+        step = infer_cell_steps(len(switches))
+        for start, end in iter_cell_edge_ranges(step):
             for j in range(start, end):
                 for k in range(len(switches[j])):
                     if switches[j][k]:
                         gene.append((PRIMITIVES[k], j - start))
-            start = end
-            n = n + 1
         return gene
     gene_normal = _parse_switches(switches_normal)
     gene_reduce = _parse_switches(switches_reduce)
 
-    concat = range(2, 6)
+    concat = range(2, 2 + infer_cell_steps(len(switches_normal)))
 
     genotype = Genotype(
         normal=gene_normal, normal_concat=concat,
@@ -663,17 +688,13 @@ def keep_2_branches(switches_in, probs):
     final_prob = [0.0 for i in range(len(switches))]
     for i in range(len(switches)):
         final_prob[i] = max(probs[i])
-    keep = [0, 1]
-    n = 3
-    start = 2
-    for i in range(3):
-        end = start + n
+    keep = []
+    for start, end in iter_cell_edge_ranges(infer_cell_steps(len(switches))):
+        n = end - start
         tb = final_prob[start:end]
         edge = sorted(range(n), key=lambda x: tb[x])
         keep.append(edge[-1] + start)
         keep.append(edge[-2] + start)
-        start = end
-        n = n + 1
     for i in range(len(switches)):
         if not i in keep:
             for j in range(len(PRIMITIVES)):
