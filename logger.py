@@ -392,7 +392,8 @@ class Logger:
         """Start Weights & Biases run"""
         _tags = [f"{key}:{value}" for key, value in tags.items() if value is not None]
         wandb.init(
-            project=self.experiment_name,
+            project="NASDAG",
+            name=self.experiment_name,
             tags=_tags,
             save_code=False,
             dir=self.file_path,
