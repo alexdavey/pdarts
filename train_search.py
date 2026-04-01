@@ -54,7 +54,7 @@ parser.add_argument('--data', type=str, default='../data', help='dataset root di
 parser.add_argument('--note', type=str, default='try', help='note for this run')
 parser.add_argument('--dropout_rate', action='append', default=[], help='dropout rate of skip connect')
 parser.add_argument('--add_width', action='append', default=['0'], help='add channels')
-parser.add_argument('--add_layers', action='append', default=['0'], help='add layers')
+parser.add_argument('--add_layers', action='append', default=[], help='add layers')
 parser.add_argument('--cell_nodes', dest='cell_steps', type=int, default=4,
                     help='Number of intermediate nodes in a cell')
 parser.add_argument('--cifar100', action='store_true', default=False, help='search with cifar100 dataset')
@@ -203,11 +203,12 @@ def main():
         add_width = args.add_width
     else:
         add_width = [0, 0, 0]
-    if len(args.add_layers) == 3:
+    if len(args.add_layers) == 0:
+        add_layers = [0, 6, 12]
+    elif len(args.add_layers) == 3:
         add_layers = args.add_layers
     else:
-        assert False, "3 add_layers must be specified"
-        # add_layers = [0, 6, 12]
+        raise ValueError("Specify either no --add_layers values or exactly 3 values")
     if len(args.dropout_rate) ==3:
         drop_rate = args.dropout_rate
     else:
