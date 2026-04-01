@@ -1,5 +1,6 @@
 python train_search.py \
     --dataset "$1" \
+    --data /scratch/sdouka/data \
     --layers 2 \
     --add_layers 0 \
     --add_layers 3 \
