@@ -1,4 +1,8 @@
 python train_search.py \
-    --dataset "$1" \
+    --dataset multnist \
     --data /scratch/sdouka/data \
-    --cell_nodes 6
+    --cell_nodes 6 \
+    --batch_size 128 \
+    --eval_batch_size 128 \
+    --epochs 25 \
+    --eval_epochs 25
